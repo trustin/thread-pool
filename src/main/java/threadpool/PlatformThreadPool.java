@@ -228,7 +228,9 @@ final class PlatformThreadPool extends AbstractThreadPool {
     }
 
     @Override
-    List<Runnable> drainUnprocessedTasks() {
+    public List<Runnable> shutdownNow() {
+        doShutdown(true, null);
+
         final int taskQueueSize;
         if (workers == scheduledWorkers) {
             taskQueueSize = workers.taskQueueSize();
@@ -243,12 +245,12 @@ final class PlatformThreadPool extends AbstractThreadPool {
     }
 
     @Override
-    boolean hasWorkers() {
+    boolean hasManagedThreads() {
         return workers.hasWorkers() || scheduledWorkers.hasWorkers();
     }
 
     @Override
-    void forEachWorker(Consumer<ManagedThread<?>> block) {
+    void forEachManagedThread(Consumer<ManagedThread<?>> block) {
         workers.forEachWorker(block);
         if (workers != scheduledWorkers) {
             scheduledWorkers.forEachWorker(block);
@@ -256,12 +258,16 @@ final class PlatformThreadPool extends AbstractThreadPool {
     }
 
     @Override
-    boolean terminateWorkers() {
-        boolean hasWorkers = workers.terminateWorkers();
+    void forEachActiveManagedThread(Consumer<ManagedThread<?>> block) {
+        forEachManagedThread(block);
+    }
+
+    @Override
+    void sendPoisonPills() {
+        workers.sendPoisonPills();
         if (workers != scheduledWorkers) {
-            hasWorkers |= scheduledWorkers.terminateWorkers();
+            scheduledWorkers.sendPoisonPills();
         }
-        return hasWorkers;
     }
 
     @Override

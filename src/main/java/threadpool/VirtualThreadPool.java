@@ -4,6 +4,7 @@ import static java.util.Objects.requireNonNull;
 import static threadpool.PlatformThreadPool.validateDelay;
 import static threadpool.ThreadPoolUtil.handleLateSubmission;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -25,11 +26,9 @@ final class VirtualThreadPool extends AbstractThreadPool {
     static final ThreadFactory threadFactory = Thread.ofVirtual().factory();
 
     // TODO: Virtual threads compatibility
-    //       - Implement shutdown/shutdownNow() in a way that can handle millions of virtual threads,
-    //         unlike JDK's ThreadPerTaskExecutor.
-    //         - Only keep the set of active virtual threads.
-    //         - Wrap all tasks so that it exits itself when the pool has been shut down.
+    //       - Support TaskExceptionHandler
     //       - Implement metrics
+    //
     // TODO: Write real test cases.
     // TODO: Write JMH benchmarks and compare against JDK ThreadPoolExecutor.
 
@@ -38,7 +37,8 @@ final class VirtualThreadPool extends AbstractThreadPool {
     private final TaskSubmissionHandler submissionHandler;
     private final TaskExceptionHandler exceptionHandler;
 
-    private final Set<ManagedThread<?>> activeTasks = ConcurrentHashMap.newKeySet();
+    private final Set<ManagedVirtualThread<?>> tasks = ConcurrentHashMap.newKeySet();
+    private final Set<ManagedVirtualThread<?>> activeTasks = ConcurrentHashMap.newKeySet();
 
     VirtualThreadPool(TaskSubmissionHandler submissionHandler,
                       TaskExceptionHandler exceptionHandler,
@@ -67,12 +67,12 @@ final class VirtualThreadPool extends AbstractThreadPool {
     private void handleSubmission(Runnable task) {
         final TaskAction action = submissionHandler.handleSubmission(task, this);
         if (action == TaskAction.accept()) {
-            final ManagedThread<?> wrappedTask;
+            final ManagedVirtualThread<?> wrappedTask;
             final Class<?> taskType = task.getClass();
             if (taskType == VirtualThreadFutureTask.class ||
                 taskType == VirtualThreadScheduledFutureTask.class) {
                 // Wrapped already by methods like `submit()` or `schedule()`.
-                wrappedTask = (ManagedThread<?>) task;
+                wrappedTask = (ManagedVirtualThread<?>) task;
             } else {
                 // Wrap the task so we can measure metrics.
                 wrappedTask = newTaskFor(task, null);
@@ -85,12 +85,12 @@ final class VirtualThreadPool extends AbstractThreadPool {
     }
 
     @Override
-    protected <T> ManagedThread<T> newTaskFor(Runnable runnable, @Nullable T value) {
+    protected <T> ManagedVirtualThread<T> newTaskFor(Runnable runnable, @Nullable T value) {
         return new VirtualThreadFutureTask<>(this, runnable, value);
     }
 
     @Override
-    protected <T> ManagedThread<T> newTaskFor(Callable<T> callable) {
+    protected <T> ManagedVirtualThread<T> newTaskFor(Callable<T> callable) {
         return new VirtualThreadFutureTask<>(this, callable);
     }
 
@@ -99,7 +99,7 @@ final class VirtualThreadPool extends AbstractThreadPool {
         requireNonNull(command, "command");
         final long delayNanos = validateDelay(delay, unit, "delay");
         final VirtualThreadScheduledFutureTask<?> task =
-                new VirtualThreadScheduledFutureTask<>(command, null, delayNanos, 0);
+                new VirtualThreadScheduledFutureTask<>(this, command, null, delayNanos, 0);
         execute(task);
         return task;
     }
@@ -109,7 +109,7 @@ final class VirtualThreadPool extends AbstractThreadPool {
         requireNonNull(callable, "callable");
         final long delayNanos = validateDelay(delay, unit, "delay");
         final VirtualThreadScheduledFutureTask<V> task =
-                new VirtualThreadScheduledFutureTask<>(callable, delayNanos);
+                new VirtualThreadScheduledFutureTask<>(this, callable, delayNanos);
         execute(task);
         return task;
     }
@@ -121,7 +121,7 @@ final class VirtualThreadPool extends AbstractThreadPool {
         final long initialDelayNanos = validateDelay(initialDelay, unit, "initialDelay");
         final long periodNanos = validateDelay(period, unit, "period");
         final VirtualThreadScheduledFutureTask<Object> task =
-                new VirtualThreadScheduledFutureTask<>(command, null, initialDelayNanos, periodNanos);
+                new VirtualThreadScheduledFutureTask<>(this, command, null, initialDelayNanos, periodNanos);
         execute(task);
         return task;
     }
@@ -133,16 +133,24 @@ final class VirtualThreadPool extends AbstractThreadPool {
         final long initialDelayNanos = validateDelay(initialDelay, unit, "initialDelay");
         final long delayNanos = validateDelay(delay, unit, "delay");
         final VirtualThreadScheduledFutureTask<Object> task =
-                new VirtualThreadScheduledFutureTask<>(command, null, initialDelayNanos, -delayNanos);
+                new VirtualThreadScheduledFutureTask<>(this, command, null, initialDelayNanos, -delayNanos);
         execute(task);
         return task;
     }
 
-    void addActiveTask(ManagedThread<?> task) {
+    void addTask(ManagedVirtualThread<?> task) {
+        tasks.add(task);
+    }
+
+    void removeTask(ManagedVirtualThread<?> task) {
+        tasks.remove(task);
+    }
+
+    void addActiveTask(ManagedVirtualThread<?> task) {
         activeTasks.add(task);
     }
 
-    void removeActiveTask(ManagedThread<?> task) {
+    void removeActiveTask(ManagedVirtualThread<?> task) {
         activeTasks.remove(task);
     }
 
@@ -152,22 +160,27 @@ final class VirtualThreadPool extends AbstractThreadPool {
     }
 
     @Override
-    List<Runnable> drainUnprocessedTasks() {
-        return List.of();
+    public List<Runnable> shutdownNow() {
+        final List<Runnable> unprocessed = new ArrayList<>();
+        doShutdown(true, unprocessed);
+        return unprocessed;
     }
 
     @Override
-    boolean hasWorkers() {
-        return false;
+    boolean hasManagedThreads() {
+        return !tasks.isEmpty();
     }
 
     @Override
-    void forEachWorker(Consumer<ManagedThread<?>> block) {
-
+    void forEachManagedThread(Consumer<ManagedThread<?>> block) {
+        tasks.forEach(block);
     }
 
     @Override
-    boolean terminateWorkers() {
-        return false;
+    void forEachActiveManagedThread(Consumer<ManagedThread<?>> block) {
+        activeTasks.forEach(block);
     }
+
+    @Override
+    void sendPoisonPills() {}
 }

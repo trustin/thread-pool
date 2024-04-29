@@ -10,17 +10,13 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import javax.annotation.Nullable;
 
 @SuppressWarnings("ComparableImplementedButEqualsNotOverridden")
-final class VirtualThreadScheduledFutureTask<V> extends ManagedThread<V> {
-
-    private static final long NANOS_PER_MILLI = TimeUnit.MILLISECONDS.toNanos(1);
+final class VirtualThreadScheduledFutureTask<V> extends ManagedVirtualThread<V> {
 
     private static final AtomicInteger differentiatorGenerator = new AtomicInteger();
 
     @SuppressWarnings("rawtypes")
     private static final AtomicIntegerFieldUpdater<VirtualThreadScheduledFutureTask> differentiatorUpdater =
             AtomicIntegerFieldUpdater.newUpdater(VirtualThreadScheduledFutureTask.class, "differentiator");
-
-    private final Callable<V> task;
 
     /**
      * If positive, the task is run at fixed rate.
@@ -41,19 +37,18 @@ final class VirtualThreadScheduledFutureTask<V> extends ManagedThread<V> {
     @SuppressWarnings("unused")
     private volatile int differentiator;
 
-    VirtualThreadScheduledFutureTask(Runnable task, @Nullable V result,
+    VirtualThreadScheduledFutureTask(VirtualThreadPool parent,
+                                     Runnable task, @Nullable V result,
                                      long initialDelayNanos, long periodNanos) {
-        super(VirtualThreadPool.threadFactory);
-        this.task = Executors.callable(task, result);
+        super(parent, Executors.callable(task, result));
         deadlineNanos = System.nanoTime() + initialDelayNanos;
         this.periodNanos = periodNanos;
         // A negative periodNanos value is always negated from a positive long value.
         assert periodNanos != Long.MIN_VALUE;
     }
 
-    VirtualThreadScheduledFutureTask(Callable<V> task, long delayNanos) {
-        super(VirtualThreadPool.threadFactory);
-        this.task = task;
+    VirtualThreadScheduledFutureTask(VirtualThreadPool parent, Callable<V> task, long delayNanos) {
+        super(parent, task);
         deadlineNanos = System.nanoTime() + delayNanos;
         periodNanos = 0; // There are no periodic `schedule*()` methods that accept a `Callable`.
     }
@@ -65,21 +60,24 @@ final class VirtualThreadScheduledFutureTask<V> extends ManagedThread<V> {
         if (isPeriodic()) {
             for (;;) {
                 delay(delayNanos);
-                task.call();
+                super.call();
                 delayNanos = updateDeadlineAndGetDelayNanos();
             }
         } else {
             delay(delayNanos);
-            return task.call();
+            if (setProcessed()) {
+                return super.call();
+            } else {
+                return null;
+            }
         }
     }
 
     private static void delay(long delayNanos) throws InterruptedException {
         if (delayNanos > 0) {
-            Thread.sleep(delayNanos / NANOS_PER_MILLI, (int) (delayNanos % NANOS_PER_MILLI));
+            TimeUnit.NANOSECONDS.sleep(delayNanos);
         }
     }
-
 
     @Override
     public boolean isPeriodic() {

@@ -52,5 +52,22 @@ class VirtualThreadPoolTest {
         System.err.println("The scheduled task was run.");
     }
 
+    @Test
+    void testShutdown() throws InterruptedException {
+        final ThreadPool threadPool = ThreadPool.ofVirtual();
+        threadPool.schedule(() -> {}, 1, TimeUnit.SECONDS);
+//        threadPool.scheduleWithFixedDelay(() -> {}, 1, 1, TimeUnit.SECONDS);
+//        threadPool.execute(() -> {
+//            try {
+//                Thread.sleep(10000);
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            }
+//        });
 
+        Thread.sleep(2000);
+        System.err.println(threadPool.shutdownNow());
+        System.err.println("shutdownNow() returned");
+        threadPool.awaitTermination();
+    }
 }

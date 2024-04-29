@@ -24,11 +24,11 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
     private final AtomicReference<ThreadPoolState> state =
             new AtomicReference<>(ThreadPoolState.STARTED);
 
-    private final Terminator terminator;
+    private final TerminationWaiter terminationWaiter;
     private final Watchdog watchdog;
 
     AbstractThreadPool(long taskTimeoutNanos, long watchdogIntervalNanos) {
-        terminator = new Terminator();
+        terminationWaiter = new TerminationWaiter();
         watchdog = taskTimeoutNanos != 0 ? new Watchdog(taskTimeoutNanos, watchdogIntervalNanos)
                                          : null;
     }
@@ -48,16 +48,10 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
 
     @Override
     public final void shutdown() {
-        doShutdown(false);
+        doShutdown(false, null);
     }
 
-    @Override
-    public final List<Runnable> shutdownNow() {
-        doShutdown(true);
-        return drainUnprocessedTasks();
-    }
-
-    private void doShutdown(boolean interrupt) {
+    final boolean doShutdown(boolean interrupt, @Nullable List<Runnable> unprocessedTasks) {
         boolean shutdownAlreadyInProgress = true;
         if (interrupt) {
             if (enterState(ThreadPoolState.STARTED,
@@ -78,24 +72,31 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
         }
 
         if (shutdownAlreadyInProgress) {
-            return;
+            return false;
         }
 
-        final boolean hasWorkers = terminateWorkers();
-        if (hasWorkers || (watchdog != null && watchdog.isStarted())) {
-            terminator.start();
+        sendPoisonPills();
+        if (hasManagedThreads() || (watchdog != null && watchdog.isStarted())) {
+            if (interrupt) {
+                forEachManagedThread(thread -> thread.cancelByShutdownNow(unprocessedTasks));
+            } else {
+                forEachManagedThread(thread -> thread.cancel(false));
+            }
+            terminationWaiter.start();
         } else {
             setTerminated();
         }
+
+        return true;
     }
 
-    abstract List<Runnable> drainUnprocessedTasks();
+    abstract boolean hasManagedThreads();
 
-    abstract boolean hasWorkers();
+    abstract void forEachManagedThread(Consumer<ManagedThread<?>> block);
 
-    abstract void forEachWorker(Consumer<ManagedThread<?>> block);
+    abstract void forEachActiveManagedThread(Consumer<ManagedThread<?>> block);
 
-    abstract boolean terminateWorkers();
+    abstract void sendPoisonPills();
 
     @Override
     public final boolean isShutdown() {
@@ -139,11 +140,6 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
         terminationFuture.complete(null);
     }
 
-    final boolean needsToInterruptWorkers() {
-        return state.get() == ThreadPoolState.SHUT_DOWN_WITH_INTERRUPTS;
-    }
-
-
     @Override
     public final CompletableFuture<?> submit(Runnable task) {
         return (CompletableFuture<?>) super.submit(task);
@@ -160,52 +156,38 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
     }
 
 
-    private final class Terminator extends ManagedThread<Void> {
+    private final class TerminationWaiter extends ManagedThread<Void> {
 
-        Terminator() {
+        TerminationWaiter() {
             super(PlatformThreadPool.threadFactory);
         }
 
         @Override
         @Nullable
         Void call() {
-            // Terminate all task workers.
-            terminateWorkers();
+            // Join all managed threads.
+            if (hasManagedThreads()) {
+                logger.debug("Waiting for termination of all threads ..");
+                do {
+                    // Wait for all workers to stop.
+                    forEachManagedThread(ManagedThread::joinThread);
+                } while (hasManagedThreads());
+                logger.debug("All threads have been terminated.");
+            }
 
             // Terminate the watchdog last so that it interrupts the long-running tasks even during shutdown.
-            terminate(watchdog, "watchdog");
+            if (watchdog != null) {
+                logger.debug("Waiting for termination of watchdog ..");
+                watchdog.cancel(true);
+                watchdog.joinThread();
+                logger.debug("Watchdog has been terminated.");
+            }
 
             // Let `ThreadPool` update its state and notify its listeners.
             setTerminated();
-
             return null;
         }
 
-        private void terminate(@Nullable ManagedThread<?> thread, String friendlyName) {
-            if (thread == null) {
-                return;
-            }
-
-            logger.debug("Terminating the {} ..", friendlyName);
-            thread.cancel(true);
-            thread.joinThread();
-            logger.debug("Terminated the {}.", friendlyName);
-        }
-
-        private void terminateWorkers() {
-            if (hasWorkers()) {
-                logger.debug("Terminating all workers ..");
-                do {
-                    // Interrupt all workers if needed.
-                    final boolean interrupt = needsToInterruptWorkers();
-                    forEachWorker(w -> w.cancel(interrupt));
-
-                    // Wait for all workers to stop.
-                    forEachWorker(ManagedThread::joinThread);
-                } while (hasWorkers());
-                logger.debug("Terminated all workers.");
-            }
-        }
     }
 
     final class Watchdog extends ManagedThread<Void> {
@@ -239,7 +221,7 @@ abstract class AbstractThreadPool extends AbstractExecutorService implements Thr
                         }
                     }
 
-                    forEachWorker(w -> {
+                    forEachActiveManagedThread(w -> {
                         final long lastActivityTimeNanos = w.lastActivityTimeNanos();
                         if (lastActivityTimeNanos == UNSPECIFIED) {
                             return;

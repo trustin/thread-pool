@@ -257,10 +257,8 @@ final class PlatformWorkerGroup {
     /**
      * Initiates the termination of all worker threads in the group by adding the poison pills
      * to the task queue.
-     *
-     * @return whether the poison pills were added or not.
      */
-    boolean terminateWorkers() {
+    void sendPoisonPills() {
         final boolean hasWorkers = hasWorkers();
         if (hasWorkers) {
             // Submit the poison pills that will terminate all workers.
@@ -268,7 +266,6 @@ final class PlatformWorkerGroup {
                 taskQueue.add(SHUTDOWN_TASK);
             }
         }
-        return hasWorkers;
     }
 
     private enum ExpirationMode {

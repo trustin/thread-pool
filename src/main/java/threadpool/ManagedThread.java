@@ -1,20 +1,28 @@
 package threadpool;
 
+import java.util.List;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.RunnableScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.annotation.Nullable;
 
 @SuppressWarnings("ComparableImplementedButEqualsNotOverridden")
 abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements RunnableScheduledFuture<T> {
 
+    enum State {
+        CREATED,
+        STARTED,
+        PROCESSED,
+        UNPROCESSED
+    }
+
     static final long UNSPECIFIED = 0;
 
     private final Thread thread;
-    private final AtomicBoolean started = new AtomicBoolean();
+    private final AtomicReference<State> state = new AtomicReference<>(State.CREATED);
 
     private long lastActivityTimeNanos = UNSPECIFIED;
 
@@ -24,13 +32,37 @@ abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements
                 if (isDone()) {
                     return;
                 }
-                updateLastActivityTimeNanos();
                 doComplete(call());
             } catch (Throwable cause) {
                 doCompleteExceptionally(cause);
+            } finally {
+                onStop();
             }
         });
     }
+
+    final void start() {
+        if (state.compareAndSet(State.CREATED, State.STARTED)) {
+            onStart();
+            thread.start();
+        }
+    }
+
+    final boolean isStarted() {
+        return state.get() != State.CREATED;
+    }
+
+    final boolean setProcessed() {
+        return state.compareAndSet(State.STARTED, State.PROCESSED);
+    }
+
+    private boolean setUnprocessed() {
+        return state.compareAndSet(State.STARTED, State.UNPROCESSED);
+    }
+
+    void onStart() {}
+
+    void onStop() {}
 
     @Nullable
     abstract T call() throws Exception;
@@ -38,16 +70,6 @@ abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements
     @Override
     public final void run() {
         throw new UnsupportedOperationException();
-    }
-
-    final void start() {
-        if (started.compareAndSet(false, true)) {
-            thread.start();
-        }
-    }
-
-    final boolean isStarted() {
-        return started.get();
     }
 
     final String threadName() {
@@ -69,7 +91,7 @@ abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements
     }
 
     @Override
-    public boolean cancel(boolean mayInterruptIfRunning) {
+    public final boolean cancel(boolean mayInterruptIfRunning) {
         final boolean cancelled = super.cancel(false);
         if (!cancelled) {
             return false;
@@ -78,6 +100,23 @@ abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements
         if (mayInterruptIfRunning) {
             interrupt();
         }
+        return true;
+    }
+
+    final boolean cancelByShutdownNow(@Nullable List<Runnable> unprocessedTasks) {
+        final boolean cancelled = cancel(true);
+        if (!cancelled) {
+            return false;
+        }
+
+        if (!setUnprocessed()) {
+            return true;
+        }
+
+        if (unprocessedTasks != null) {
+            unprocessedTasks.add(this);
+        }
+
         return true;
     }
 
@@ -107,17 +146,17 @@ abstract class ManagedThread<T> extends CompletableScheduledFuture<T> implements
     }
 
     @SuppressWarnings("ResultOfMethodCallIgnored")
-    private void doComplete(T value) {
+    private boolean doComplete(@Nullable T value) {
         // Clear the interrupt state of the thread so that an interrupt is not propagated to callbacks.
         Thread.interrupted();
-        super.complete(value);
+        return super.complete(value);
     }
 
     @SuppressWarnings("ResultOfMethodCallIgnored")
-    private void doCompleteExceptionally(Throwable cause) {
+    private boolean doCompleteExceptionally(Throwable cause) {
         // Clear the interrupt state of the thread so that an interrupt is not propagated to callbacks.
         Thread.interrupted();
-        super.completeExceptionally(cause);
+        return super.completeExceptionally(cause);
     }
 
     @Override
